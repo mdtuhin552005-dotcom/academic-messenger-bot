@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -512,6 +513,66 @@ def append_user_history(user_id: Optional[str], user_text: str, model_text: str)
             logger.warning("Failed to save chat history: %s", e)
 
 
+def _fetch_attachment_part(att: dict) -> Optional[dict]:
+    """Fetch an attachment URL from Messenger and prepare an inlineData Gemini part."""
+    att_type = att.get("type", "").lower()
+    url = att.get("payload", {}).get("url")
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        raw_bytes = resp.content
+        if len(raw_bytes) > 20 * 1024 * 1024:
+            logger.warning("Attachment from %s too large (%d bytes); skipping.", url, len(raw_bytes))
+            return None
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+        mime_type = None
+        if att_type == "image" or content_type.startswith("image/"):
+            if "png" in content_type:
+                mime_type = "image/png"
+            elif "webp" in content_type:
+                mime_type = "image/webp"
+            elif "gif" in content_type:
+                mime_type = "image/gif"
+            else:
+                mime_type = "image/jpeg"
+        elif att_type == "audio" or content_type.startswith("audio/"):
+            if "wav" in content_type:
+                mime_type = "audio/wav"
+            elif "ogg" in content_type:
+                mime_type = "audio/ogg"
+            elif "aac" in content_type:
+                mime_type = "audio/aac"
+            elif "mp3" in content_type or "mpeg" in content_type:
+                mime_type = "audio/mp3"
+            else:
+                mime_type = "audio/mp4"
+        elif att_type == "file" or content_type.startswith("application/pdf") or content_type.startswith("text/"):
+            if "pdf" in content_type or url.lower().endswith(".pdf"):
+                mime_type = "application/pdf"
+            elif "csv" in content_type:
+                mime_type = "text/csv"
+            elif "text" in content_type:
+                mime_type = "text/plain"
+            else:
+                mime_type = "application/pdf"
+
+        if mime_type:
+            b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+            return {
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": b64_data,
+                }
+            }
+    except Exception as err:
+        logger.warning("Failed to fetch attachment from %s: %s", url, err)
+    return None
+
+
 def generate_gemini_reply(
     question: str,
     items: list[AcademicItem],
@@ -519,8 +580,9 @@ def generate_gemini_reply(
     lead_days: int = REMINDER_LEAD_DAYS_DEFAULT,
     api_key: Optional[str] = None,
     user_id: Optional[str] = None,
+    attachments: Optional[list] = None,
 ) -> Optional[str]:
-    """Generate a multi-turn, language-adaptive response using Gemini AI."""
+    """Generate a multi-turn, language-adaptive response using Gemini AI, supporting audio, images and files."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -542,21 +604,28 @@ def generate_gemini_reply(
         "1. MEMORY & CONTEXT:\n"
         "   - You remember past conversation turns from this chat. Seamlessly reference past context, user names, or discussed topics when appropriate.\n"
         "2. LANGUAGE ADAPTATION (MANDATORY):\n"
-        "   - If the user writes in English, reply ONLY in natural, fluent English.\n"
-        "   - If the user writes in Banglish (Bengali words in English alphabet, e.g. 'kmn acho', 'math jogojikoron koraitase', 'ajke ki kaj ache'), reply in authentic Bengali script (বাংলা ভাষায়, যেমন: 'আলহামদুলিল্লাহ, ভালো আছি!').\n"
+        "   - If the user writes or speaks in English, reply ONLY in natural, fluent English.\n"
+        "   - If the user writes or speaks in Banglish (Bengali words in English alphabet, e.g. 'kmn acho', 'ajke ki kaj ache') or Bengali, reply in authentic Bengali script (বাংলা ভাষায়, যেমন: 'আলহামদুলিল্লাহ, ভালো আছি!').\n"
         "   - If the user writes in Bengali script (বাংলা), reply in Bengali script (বাংলা).\n"
         "3. PROMPTS & CUSTOM INSTRUCTIONS (MANDATORY):\n"
-        "   - If the user gives a specific format or instruction (e.g. 'bullet point e bolo', 'point akare dao', 'translate to...', 'write a poem', 'act as a teacher', '1 sentence e dao'), ALWAYS strictly follow that prompt instruction and formatting above all else.\n"
-        "4. TASKS & SCHEDULE:\n"
-        "   - When asked about tasks, what to do, or deadlines, check the schedule items above and answer concisely and accurately.\n"
+        "   - If the user gives a specific format or instruction (e.g. 'bullet point e bolo', 'point akare dao', 'translate to...', 'solve this problem', '1 sentence e dao'), ALWAYS strictly follow that prompt instruction above all else.\n"
+        "4. VOICE MESSAGES & AUDIO (MANDATORY):\n"
+        "   - When the user sends a voice note / audio recording, listen carefully to what was spoken in any language (Bengali, Banglish, English).\n"
+        "   - Understand their spoken question or request completely, and reply with warmth and accuracy following the language rules.\n"
+        "5. PHOTOS, IMAGES & DOCUMENTS (MANDATORY):\n"
+        "   - When the user sends a photo, handwritten note, question paper, exam routine, math equation, or PDF/document, analyze all visual elements and read the text.\n"
+        "   - Solve problems, explain concepts, summarize routines, or answer questions based on the image/file accurately.\n"
+        "6. TASKS & SCHEDULE:\n"
+        "   - When asked about tasks, routine, or deadlines, check the schedule items above and answer concisely and accurately.\n"
         "   - Do NOT dump unrequested large lists or menus when the user just greets or asks a simple question.\n"
-        "5. TONE & STYLE:\n"
-        "   - Answer directly to what was asked. Keep replies friendly, concise, and nicely formatted with emojis for mobile chat."
+        "7. TONE & STYLE:\n"
+        "   - Keep replies friendly, concise, natural, and nicely formatted with emojis for mobile chat."
     )
 
     models = (
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
-        "gemini-flash-latest",
         "gemini-3.8-flash",
     )
 
@@ -567,7 +636,37 @@ def generate_gemini_reply(
         text = turn.get("text", "")
         if text:
             contents.append({"role": role, "parts": [{"text": text}]})
-    contents.append({"role": "user", "parts": [{"text": question}]})
+
+    user_parts = []
+    has_audio = False
+    has_image = False
+    has_doc = False
+    if attachments:
+        for att in attachments:
+            part = _fetch_attachment_part(att)
+            if part:
+                user_parts.append(part)
+                mtype = part["inlineData"]["mimeType"]
+                if mtype.startswith("audio/"):
+                    has_audio = True
+                elif mtype.startswith("image/"):
+                    has_image = True
+                else:
+                    has_doc = True
+
+    prompt_text = question.strip() if question else ""
+    if not prompt_text:
+        hints = []
+        if has_audio:
+            hints.append("Listen carefully to the user's voice message / audio note, understand everything they asked or said, and respond naturally and helpfully.")
+        if has_image:
+            hints.append("Examine the photo/image carefully, read any text, math, handwriting, questions, or diagrams, and provide an accurate and clear response.")
+        if has_doc:
+            hints.append("Review this document/file carefully and assist the user based on its content.")
+        prompt_text = " ".join(hints) if hints else "Hello! How can I help you today?"
+
+    user_parts.append({"text": prompt_text})
+    contents.append({"role": "user", "parts": user_parts})
 
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -578,11 +677,11 @@ def generate_gemini_reply(
             "contents": contents,
             "generationConfig": {
                 "temperature": 0.7,
-                "maxOutputTokens": 800,
+                "maxOutputTokens": 1000,
             },
         }
         try:
-            resp = requests.post(url, json=payload, timeout=12)
+            resp = requests.post(url, json=payload, timeout=25)
             if resp.status_code == 200:
                 data = resp.json()
                 text = (
@@ -594,7 +693,8 @@ def generate_gemini_reply(
                 )
                 if text:
                     if user_id:
-                        append_user_history(user_id, question, text)
+                        history_question = question if question else ("[Voice message]" if has_audio else "[Photo/File]")
+                        append_user_history(user_id, history_question, text)
                     return text
             else:
                 logger.warning("Gemini API %s error %d: %s", model, resp.status_code, resp.text[:150])
@@ -708,17 +808,23 @@ def answer_question(
     today: Optional[date] = None,
     lead_days: int = REMINDER_LEAD_DAYS_DEFAULT,
     user_id: Optional[str] = None,
+    attachments: Optional[list] = None,
 ) -> str:
     today = today or date.today()
     items = list(items)
     command = question.strip().lower().strip("!?. ")
-    if command in {"help", "commands", "menu"}:
+    if command in {"help", "commands", "menu"} and not attachments:
         return HELP_TEXT
 
-    # 1. AI reply with Gemini (if GEMINI_API_KEY is configured): answers ANY message directly and concisely
-    ai_reply = generate_gemini_reply(question, items, today, lead_days, user_id=user_id)
+    # 1. AI reply with Gemini (supports text, voice audio, images, files)
+    ai_reply = generate_gemini_reply(
+        question, items, today, lead_days, user_id=user_id, attachments=attachments
+    )
     if ai_reply:
         return ai_reply
+
+    if not question and attachments:
+        return "আমি আপনার পাঠানো ফাইল/ভয়েস মেসেজটি পেয়েছি, কিন্তু এই মুহূর্তে এআই প্রসেস করতে পারছে না। দয়া করে একটু পর আবার চেষ্টা করুন বা লিখে জানান! 😊"
 
     # 2. Offline fallback for help greetings
     if command in GREETING_WORDS:

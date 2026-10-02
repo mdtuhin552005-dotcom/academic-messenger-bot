@@ -221,10 +221,10 @@ def _admin_denied_response():
     return None
 
 
-def _reply_for(psid: str, text: str) -> str:
+def _reply_for(psid: str, text: str, attachments: Optional[list] = None) -> str:
     """Build the reply for one incoming Messenger message."""
     command = text.strip().lower().rstrip("!?. ")
-    if command in {"my id", "id", "psid", "whoami"}:
+    if command in {"my id", "id", "psid", "whoami"} and not attachments:
         return (
             "🆔 Your Messenger PSID (page-scoped ID) is:\n"
             f"{psid}\n\n"
@@ -233,7 +233,12 @@ def _reply_for(psid: str, text: str) -> str:
         )
     today = _academic_today()
     return answer_question(
-        text, _load_items(today), today, _reminder_lead_days(), user_id=psid
+        text,
+        _load_items(today),
+        today,
+        _reminder_lead_days(),
+        user_id=psid,
+        attachments=attachments,
     )
 
 
@@ -422,11 +427,19 @@ def create_app(start_scheduler: bool = True) -> Flask:
                 message = event.get("message", {})
                 sender_psid = event.get("sender", {}).get("id")
                 text = message.get("text", "").strip()
-                if not sender_psid or not text or message.get("is_echo"):
+                attachments = message.get("attachments", [])
+                if not sender_psid or message.get("is_echo"):
                     continue
-                logger.info("Received incoming message from %s: %r", sender_psid, text)
+                if not text and not attachments:
+                    continue
+                logger.info(
+                    "Received incoming message from %s: text=%r, attachments=%d",
+                    sender_psid,
+                    text,
+                    len(attachments),
+                )
                 try:
-                    reply = _reply_for(sender_psid, text)
+                    reply = _reply_for(sender_psid, text, attachments=attachments)
                     _send_messenger_message(sender_psid, reply)
                     logger.info("Sent reply to %s", sender_psid)
                     replies_sent += 1
