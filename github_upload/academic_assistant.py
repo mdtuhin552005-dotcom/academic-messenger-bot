@@ -53,6 +53,12 @@ _DATE_PATTERNS = (
         r"Dec(?:ember)?)\s+\d{1,2}(?:,?\s+\d{4})?\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b\d{1,2}(?:st|nd|rd|th)?(?:\s*[-/–—]?\s*|\s+)(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)(?:\s*,?\s*\d{4})?\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -61,6 +67,8 @@ def parse_date(value: str, current_date: Optional[date] = None) -> Optional[date
     if not value:
         return None
     current_date = current_date or date.today()
+    cleaned = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", value, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[-–—/]+", " ", cleaned).strip()
     formats = (
         "%Y-%m-%d",
         "%m/%d/%Y",
@@ -75,15 +83,20 @@ def parse_date(value: str, current_date: Optional[date] = None) -> Optional[date
         "%b %d, %Y",
         "%b %d %Y",
         "%b %d",
+        "%d %B %Y",
+        "%d %B",
+        "%d %b %Y",
+        "%d %b",
     )
-    for date_format in formats:
-        try:
-            parsed = datetime.strptime(value, date_format).date()
-            if "%Y" not in date_format and "%y" not in date_format:
-                parsed = parsed.replace(year=current_date.year)
-            return parsed
-        except ValueError:
-            continue
+    for target_val in (cleaned, value):
+        for date_format in formats:
+            try:
+                parsed = datetime.strptime(target_val, date_format).date()
+                if "%Y" not in date_format and "%y" not in date_format:
+                    parsed = parsed.replace(year=current_date.year)
+                return parsed
+            except ValueError:
+                continue
     raise ValueError(f"Unsupported date value: {value!r}")
 
 
@@ -177,39 +190,77 @@ def _dates_in_text(text: str, current_date: date) -> list[date]:
     return found
 
 
+WEEKDAYS_MAP = {
+    "monday": 0, "sombar": 0, "সোমবার": 0,
+    "tuesday": 1, "mongolbar": 1, "মঙ্গলবার": 1,
+    "wednesday": 2, "budhbar": 2, "বুধবার": 2,
+    "thursday": 3, "brihospotibar": 3, "বৃহস্পতিবার": 3,
+    "friday": 4, "shukrobar": 4, "শুক্রবার": 4,
+    "saturday": 5, "shonibar": 5, "শনিবার": 5,
+    "sunday": 6, "robibar": 6, "রবিবার": 6,
+}
+
+
+def _parse_weekday(text: str, current_date: date) -> Optional[date]:
+    clean = text.strip().lower().rstrip(":.-")
+    for name, day_idx in WEEKDAYS_MAP.items():
+        if clean == name or clean.startswith(name + " ") or clean.startswith(name + ":"):
+            diff = (day_idx - current_date.weekday()) % 7
+            return current_date + timedelta(days=diff)
+    return None
+
+
 def items_from_doc(document: dict, current_date: Optional[date] = None) -> list[AcademicItem]:
     current_date = current_date or date.today()
     result = []
     tabs = document.get("tabs", [])
-    if tabs:
-        for tab in tabs:
-            tab_title = tab.get("tabProperties", {}).get("title", "Google Doc")
-            doc_tab = tab.get("documentTab", {})
-            body = doc_tab.get("body", {}).get("content", [])
-            for paragraph in _google_doc_paragraphs(body):
-                dates = _dates_in_text(paragraph, current_date)
-                for item_date in dates or [None]:
+
+    def process_body(paragraphs: list[str], source_name: str) -> None:
+        last_heading_date = None
+        for paragraph in paragraphs:
+            dates = _dates_in_text(paragraph, current_date)
+            weekday_date = _parse_weekday(paragraph, current_date) if not dates else None
+            if dates:
+                last_heading_date = dates[0]
+                for item_date in dates:
                     result.append(
                         AcademicItem(
                             title=paragraph,
                             category="Project / document",
                             due_date=item_date,
-                            source=f"Google Doc ({tab_title})",
+                            source=source_name,
                         )
                     )
-    else:
-        body = document.get("body", {}).get("content", [])
-        for paragraph in _google_doc_paragraphs(body):
-            dates = _dates_in_text(paragraph, current_date)
-            for item_date in dates or [None]:
+            elif weekday_date:
+                last_heading_date = weekday_date
+                result.append(
+                    AcademicItem(
+                        title=paragraph,
+                        category="Routine",
+                        due_date=weekday_date,
+                        source=source_name,
+                    )
+                )
+            else:
                 result.append(
                     AcademicItem(
                         title=paragraph,
                         category="Project / document",
-                        due_date=item_date,
-                        source="Google Doc",
+                        due_date=last_heading_date,
+                        source=source_name,
                     )
                 )
+
+    if tabs:
+        for tab in tabs:
+            tab_title = tab.get("tabProperties", {}).get("title", "Google Doc")
+            doc_tab = tab.get("documentTab", {})
+            body = doc_tab.get("body", {}).get("content", [])
+            process_body(_google_doc_paragraphs(body), f"Google Doc ({tab_title})")
+    else:
+        body = document.get("body", {}).get("content", [])
+        process_body(_google_doc_paragraphs(body), "Google Doc")
+
     return result
 
 
@@ -458,6 +509,76 @@ def format_deadline_reminder(
     return "\n".join(lines)
 
 
+def generate_ai_notification(
+    notification_type: str,
+    items: list[AcademicItem],
+    today: date,
+    lead_days: int = REMINDER_LEAD_DAYS_DEFAULT,
+    api_key: Optional[str] = None,
+) -> str:
+    """Format morning summary or evening reminders into a warm, structured, headed Bengali message."""
+    api_key = api_key or os.getenv("GEMINI_API_KEY")
+
+    if notification_type == "morning":
+        fallback = format_daily_summary(items, today)
+    else:
+        fallback = format_deadline_reminder(items, today, lead_days)
+
+    if not api_key:
+        return fallback
+
+    items_text = "\n".join(
+        f"- [{it.category}] {it.title} (Due: {it.due_date.strftime('%Y-%m-%d') if it.due_date else 'No date'})"
+        for it in items
+    ) or "No items recorded."
+
+    time_label = "সকাল ৬:০০ টার রুটিন ও সারসংক্ষেপ" if notification_type == "morning" else "রাত ৮:০০ টার ডেডলাইন ও আগামীকালের রুটিন"
+    prompt = (
+        f"Today is {today.strftime('%A, %B %d, %Y')}.\n"
+        f"You are the user's personal academic assistant. Generate a compact, standard-format {time_label} for Facebook Messenger in Bengali (বাংলা ভাষায়).\n\n"
+        f"All tasks and routine from Google Sheets & Docs:\n{items_text}\n\n"
+        "MANDATORY FORMAT & CONCISENESS RULES:\n"
+        "1. STRICT CONCISENESS: Keep the entire message crisp, compact, and under 80 words. NO long intros, NO study tips, NO verbose fluff.\n"
+        "2. STANDARD STRUCTURE:\n"
+        "   - Top bold heading (e.g. '**🌅 আজকের রুটিন ও কাজ**' for morning, or '**🌙 আগামীকালের রুটিন ও ডেডলাইন**' for evening).\n"
+        "   - Clean bullet points: '• [সময়/বিষয়]: [ক্লাস/রুম/কাজ]'.\n"
+        "   - If there is an upcoming next-day task, list in 1-2 bullet points under '**📌 পরবর্তী কাজ:**'.\n"
+        "   - If no tasks exist, state in 1 short line: '• কোনো ক্লাস বা নির্ধারিত ডেডলাইন নেই।'\n"
+        "   - 1 short closing line: 'শুভ সকাল! 🌟' or 'শুভ রাত্রি! ✨'.\n"
+        "3. Messenger formatting: Use bold '**Title**' and bullets '•'. Do NOT use '#' headers or '---' dividers."
+    )
+
+    models = (
+        "gemini-flash-lite-latest",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
+    )
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 300},
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code == 200:
+                text = (
+                    resp.json()
+                    .get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    .strip()
+                )
+                if text:
+                    return text
+        except Exception as e:
+            logger.warning("AI notification generation failed with %s: %s", model, e)
+            continue
+
+    return fallback
+
+
 def _requested_date(question: str, today: date) -> Optional[date]:
     lowered = question.lower()
     if "day after tomorrow" in lowered:
@@ -602,31 +723,33 @@ def generate_gemini_reply(
         f"{items_text}\n\n"
         "STRICT CORE RULES:\n"
         "1. MEMORY & CONTEXT:\n"
-        "   - You remember past conversation turns from this chat. Seamlessly reference past context, user names, or discussed topics when appropriate.\n"
+        "   - You remember past conversation turns from this chat. Seamlessly reference past context when appropriate.\n"
         "2. LANGUAGE ADAPTATION (MANDATORY):\n"
         "   - If the user writes or speaks in English, reply ONLY in natural, fluent English.\n"
-        "   - If the user writes or speaks in Banglish (Bengali words in English alphabet, e.g. 'kmn acho', 'ajke ki kaj ache') or Bengali, reply in authentic Bengali script (বাংলা ভাষায়, যেমন: 'আলহামদুলিল্লাহ, ভালো আছি!').\n"
+        "   - If the user writes or speaks in Banglish (e.g. 'kmn acho', 'ajke ki kaj ache') or Bengali, reply in authentic Bengali script (বাংলা ভাষায়).\n"
         "   - If the user writes in Bengali script (বাংলা), reply in Bengali script (বাংলা).\n"
         "3. PROMPTS & CUSTOM INSTRUCTIONS (MANDATORY):\n"
         "   - If the user gives a specific format or instruction (e.g. 'bullet point e bolo', 'point akare dao', 'translate to...', 'solve this problem', '1 sentence e dao'), ALWAYS strictly follow that prompt instruction above all else.\n"
-        "4. VOICE MESSAGES & AUDIO (MANDATORY):\n"
-        "   - When the user sends a voice note / audio recording, listen carefully to what was spoken in any language (Bengali, Banglish, English).\n"
-        "   - Understand their spoken question or request completely, and reply with warmth and accuracy following the language rules.\n"
-        "5. PHOTOS, IMAGES & DOCUMENTS (MANDATORY):\n"
-        "   - When the user sends a photo, handwritten note, question paper, exam routine, math equation, or PDF/document, analyze all visual elements and read the text.\n"
-        "   - Solve problems, explain concepts, summarize routines, or answer questions based on the image/file accurately.\n"
-        "6. TASKS & SCHEDULE:\n"
-        "   - When asked about tasks, routine, or deadlines, check the schedule items above and answer concisely and accurately.\n"
-        "   - Do NOT dump unrequested large lists or menus when the user just greets or asks a simple question.\n"
-        "7. TONE & STYLE:\n"
-        "   - Keep replies friendly, concise, natural, and nicely formatted with emojis for mobile chat."
+        "4. EXACT TARGETED ANSWERING (MANDATORY - DO NOT OVER-ANSWER):\n"
+        "   - Answer ONLY the exact specific thing the user asked about. DO NOT dump the entire document, other subjects, or the full day's routine.\n"
+        "   - Specific time query (যেমন: '১০টায় কি ক্লাস' বা '10 AM class'): Answer ONLY what is scheduled at 10:00 (যেমন: 'সকাল ১০:০০ টায় PHY127 - Physics II ক্লাস আছে (রুম: B3202)।'). NEVER mention other times, other classes, or unrelated assignments.\n"
+        "   - Specific subject or task query (যেমন: 'physics assignment kobe'): Answer ONLY about that specific task/subject.\n"
+        "   - Full schedule / routine: ONLY provide multiple classes or the full day's routine if the user explicitly asks for 'সারাদিনের রুটিন', 'সব ক্লাস', 'আজকের সব কাজ', or a specific day's routine (যেমন: 'রবিবারের রুটিন').\n"
+        "   - Casual chat & greetings: Keep within 1-2 friendly lines.\n"
+        "   - Explanations, math, document/image questions, or voice queries:\n"
+        "       * Give the direct, clear answer or solution first.\n"
+        "       * Use at most 2-4 short bullet points if explaining steps.\n"
+        "       * Strictly avoid unsolicited study advice, long lecturing, or filler conclusions.\n"
+        "   - Messenger formatting: Never use '#' Markdown headers. Use bold '**Title**' and bullet points '•'.\n"
+        "5. MULTIMODAL INPUTS (MANDATORY):\n"
+        "   - Voice notes / audio: Listen carefully to what was spoken in any language and reply concisely.\n"
+        "   - Photos, images & documents: Examine all visual elements, formulas, routines, or PDFs and answer accurately and directly."
     )
 
     models = (
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
-        "gemini-3.8-flash",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
     )
 
     history = load_user_history(user_id)
@@ -658,11 +781,11 @@ def generate_gemini_reply(
     if not prompt_text:
         hints = []
         if has_audio:
-            hints.append("Listen carefully to the user's voice message / audio note, understand everything they asked or said, and respond naturally and helpfully.")
+            hints.append("Listen carefully to the user's voice message / audio note, understand everything they asked or said, and respond concisely.")
         if has_image:
-            hints.append("Examine the photo/image carefully, read any text, math, handwriting, questions, or diagrams, and provide an accurate and clear response.")
+            hints.append("Examine the photo/image carefully, read any text, math, handwriting, questions, or diagrams, and provide an accurate, concise response.")
         if has_doc:
-            hints.append("Review this document/file carefully and assist the user based on its content.")
+            hints.append("Review this document/file carefully and assist the user concisely based on its content.")
         prompt_text = " ".join(hints) if hints else "Hello! How can I help you today?"
 
     user_parts.append({"text": prompt_text})
@@ -676,8 +799,8 @@ def generate_gemini_reply(
             },
             "contents": contents,
             "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 1000,
+                "temperature": 0.2,
+                "maxOutputTokens": 300,
             },
         }
         try:

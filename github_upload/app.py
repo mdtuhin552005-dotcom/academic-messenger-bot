@@ -3,15 +3,17 @@ import hashlib
 import hmac
 import logging
 import os
+import sys
 import time
 from datetime import date, datetime
 from threading import Lock
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, current_app, has_request_context, jsonify, request
 
 from academic_assistant import (
     REMINDER_LEAD_DAYS_DEFAULT,
@@ -19,6 +21,7 @@ from academic_assistant import (
     answer_question,
     format_daily_summary,
     format_deadline_reminder,
+    generate_ai_notification,
     repository_from_environment,
 )
 
@@ -166,14 +169,65 @@ def _verify_signature(raw_body: bytes) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
-def _load_items(today: date) -> list[AcademicItem]:
-    return repository_from_environment().fetch_items(today)
+def _send_action(recipient_psid: str, action: str) -> None:
+    page_token = os.getenv("META_PAGE_ACCESS_TOKEN")
+    if not page_token:
+        return
+    api_version = os.getenv("META_GRAPH_API_VERSION", "v23.0")
+    url = f"https://graph.facebook.com/{api_version}/me/messages"
+    try:
+        requests.post(
+            url,
+            params={"access_token": page_token},
+            json={"recipient": {"id": recipient_psid}, "sender_action": action},
+            timeout=3,
+        )
+    except Exception as err:
+        logger.debug("Failed to send sender action %s: %s", action, err)
+
+
+_items_cache: Optional[list[AcademicItem]] = None
+_items_cache_time: float = 0.0
+_items_cache_date: Optional[date] = None
+_cache_lock = Lock()
+_CACHE_TTL_SECONDS = 300  # 5 minutes cache for lightning-fast replies
+
+
+def _clear_items_cache() -> None:
+    global _items_cache, _items_cache_time, _items_cache_date
+    with _cache_lock:
+        _items_cache = None
+        _items_cache_time = 0.0
+        _items_cache_date = None
+
+
+def _load_items(today: date, force_refresh: bool = False) -> list[AcademicItem]:
+    global _items_cache, _items_cache_time, _items_cache_date
+    if _env_flag("DISABLE_ITEMS_CACHE", False) or "unittest" in sys.modules or (has_request_context() and current_app.testing):
+        return repository_from_environment().fetch_items(today)
+
+    now = time.time()
+    with _cache_lock:
+        if (
+            not force_refresh
+            and _items_cache is not None
+            and _items_cache_date == today
+            and (now - _items_cache_time) < _CACHE_TTL_SECONDS
+        ):
+            return _items_cache
+
+        items = repository_from_environment().fetch_items(today)
+        _items_cache = items
+        _items_cache_time = now
+        _items_cache_date = today
+        return items
 
 
 def send_daily_summary() -> str:
     """Send today's/tomorrow's summary and return the message text."""
     today = _academic_today()
-    summary = format_daily_summary(_load_items(today), today)
+    items = _load_items(today, force_refresh=True)
+    summary = generate_ai_notification("morning", items, today)
     _send_messenger_message(_required_env("ACADEMIC_RECIPIENT_PSID"), summary)
     logger.info("Sent the daily academic summary.")
     return summary
@@ -183,7 +237,8 @@ def send_deadline_reminder() -> str:
     """Send upcoming/overdue deadline reminders and return the message text."""
     today = _academic_today()
     lead_days = _reminder_lead_days()
-    message = format_deadline_reminder(_load_items(today), today, lead_days)
+    items = _load_items(today, force_refresh=True)
+    message = generate_ai_notification("evening", items, today, lead_days=lead_days)
     _send_messenger_message(_required_env("ACADEMIC_RECIPIENT_PSID"), message)
     logger.info("Sent deadline reminders (lead time: %d day(s)).", lead_days)
     return message
@@ -232,6 +287,10 @@ def _reply_for(psid: str, text: str, attachments: Optional[list] = None) -> str:
             "send you the daily summary and deadline reminders."
         )
     today = _academic_today()
+    if command in {"refresh", "reload", "update", "/refresh", "/reload"} and not attachments:
+        items = _load_items(today, force_refresh=True)
+        return f"🔄 গুগল শিট ও ডক থেকে সর্বশেষ তথ্য রিফ্রেশ করা হয়েছে! (মোট {len(items)}টি আইটেম সক্রিয়)"
+
     return answer_question(
         text,
         _load_items(today),
@@ -439,6 +498,8 @@ def create_app(start_scheduler: bool = True) -> Flask:
                     len(attachments),
                 )
                 try:
+                    _send_action(sender_psid, "mark_seen")
+                    _send_action(sender_psid, "typing_on")
                     reply = _reply_for(sender_psid, text, attachments=attachments)
                     _send_messenger_message(sender_psid, reply)
                     logger.info("Sent reply to %s", sender_psid)
