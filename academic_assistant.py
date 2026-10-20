@@ -570,47 +570,35 @@ def _race_gemini_models(
     models: Iterable[str],
     api_key: str,
     payload_builder: Callable[[str], dict],
-    timeout: int = 10,
+    timeout: int = 4,
 ) -> Optional[tuple[str, str]]:
     """
-    Race multiple Gemini models concurrently in parallel threads.
-    The first model to respond with HTTP 200 and a valid non-empty answer wins.
+    Execute candidate Gemini models with rapid failover to maximize speed while strictly conserving API quota.
+    Supports comma-separated API keys in GEMINI_API_KEY for automatic quota rotation.
     """
     model_list = [m.strip() for m in models if m.strip()]
     if not model_list or not api_key:
         return None
 
+    keys = [k.strip() for k in api_key.split(",") if k.strip()]
     t0 = time.time()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(model_list))
-    futures: dict[concurrent.futures.Future, str] = {}
 
-    for model in model_list:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = payload_builder(model)
-        fut = executor.submit(_request_gemini_candidate, model, url, payload, timeout)
-        futures[fut] = model
-
-    winner: Optional[tuple[str, str]] = None
-    try:
-        for fut in concurrent.futures.as_completed(futures):
-            res = fut.result()
+    for active_key in keys:
+        for model in model_list:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={active_key}"
+            payload = payload_builder(model)
+            res = _request_gemini_candidate(model, url, payload, timeout=timeout)
             if res:
-                winner = res
                 elapsed = time.time() - t0
                 logger.info(
-                    "🏁 Gemini race winner: %s in %.2fs (length: %d chars)",
-                    winner[0],
+                    "🏁 Gemini response from: %s in %.2fs (length: %d chars)",
+                    res[0],
                     elapsed,
-                    len(winner[1]),
+                    len(res[1]),
                 )
-                break
-    finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            executor.shutdown(wait=False)
+                return res
 
-    return winner
+    return None
 
 
 def generate_ai_notification(
@@ -663,7 +651,7 @@ def generate_ai_notification(
         }
 
     winner = _race_gemini_models(
-        GEMINI_CANDIDATE_MODELS, api_key, _build_notification_payload, timeout=12
+        GEMINI_CANDIDATE_MODELS, api_key, _build_notification_payload, timeout=6
     )
     if winner:
         return winner[1]
@@ -1056,7 +1044,7 @@ def generate_gemini_reply(
         }
 
     winner = _race_gemini_models(
-        GEMINI_CANDIDATE_MODELS, api_key, _build_chat_payload, timeout=12
+        GEMINI_CANDIDATE_MODELS, api_key, _build_chat_payload, timeout=4
     )
     if winner:
         winning_model, winning_text = winner
@@ -1074,18 +1062,45 @@ def conversational_reply(
     items: list[AcademicItem],
     today: date,
     lead_days: int = REMINDER_LEAD_DAYS_DEFAULT,
+    user_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Smart built-in Bengali / Banglish conversational responder."""
+    """Smart built-in Bengali / Banglish conversational and schedule assistant."""
     lowered = question.lower().strip()
-    clean = re.sub(r"[^\w\s\u0980-\u09FF]", " ", lowered)
+    clean = re.sub(r"[^\w\sঀ-৿]", " ", lowered)
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    # 1. Greetings & Well-being
-    if re.search(r"\b(kemon|kmn|kemn)\s*(acho|asen|aso|achen|acis|asis)\b|\b(valo|bhalo)\s*(acho|aso|asen|achen)\b|কেমন\s*(আছো|আছেন|আছিস)|ভালো\s*(আছো|আছেন)|how\s+are\s+you|how\s+r\s+u", clean):
-        return "আলহামদুলিল্লাহ, আমি খুব ভালো আছি! 😊 আপনি কেমন আছেন? আজকের কাজ বা কোনো শিডিউলের খোঁজ নিবেন?"
+    # Load permanent user memory
+    profile = load_user_profile(user_id)
+    roll_num = profile.get("roll", "514250")
+    for n in profile.get("notes", []):
+        m_r = re.search(r"(\d{5,7})", n)
+        if m_r:
+            roll_num = m_r.group(1)
+            break
+    user_name = profile.get("name", "তুহিন")
+    clean_user_name = re.split(r"[\s(]", user_name)[0].strip() or "তুহিন"
+    dept_name = profile.get("department", "CSE")
 
-    if re.search(r"\b(ki|kee)\s*(obostha|khobor|khbr)\b|কী\s*(অবস্থা|খবর)|whats?\s*up", clean):
-        return "আলহামদুলিল্লাহ, সব ঠিকঠাক চলছে! আপনার পড়াশোনা ও কাজের কী অবস্থা? আজকের কোনো আপডেট জানতে চান?"
+    # 1. Roll number queries
+    if re.search(r"\b(roll|rol)\b|রোল", clean):
+        return f"আপনার রোল নম্বর হলো **{roll_num}**। 📝"
+
+    # 2. Identity / Name queries
+    if re.search(r"\b(amar|amr|my)\s*nam\b|আমার\s*নাম|who\s*am\s*i|আমাকে\s*চেনো|amake\s*cheno", clean):
+        return f"আপনার নাম **{clean_user_name}**। আপনি {dept_name} ডিপার্টমেন্টের শিক্ষার্থী। 😊"
+
+    # 3. Department queries
+    if re.search(r"\b(dept|department)\b|ডিপার্টমেন্ট|বিভাগ", clean):
+        return f"আপনার ডিপার্টমেন্ট হলো **{dept_name}**। 💻"
+
+    # 4. Remember user fact
+    if re.search(r"\b(?:mone|mon)\s*(?:rakhba|rekho|rakho)\b|\bremember\b", clean):
+        remember_user_fact(user_id, question)
+        return "অবশ্যই, আমি আপনার এই তথ্যটি মনে রেখেছি এবং সেভ করে নিয়েছি! 📝"
+
+    # 5. Greetings & Well-being
+    if re.search(r"\b(kire|ki\s*khobor|ki\s*obostha|kmn|kemon|kemn|hi|hello|hey)\b|কেমন|কী\s*অবস্থা|কী\s*খবর", clean):
+        return "আলহামদুলিল্লাহ, আমি খুব ভালো আছি! 😊 আপনার পড়াশোনা বা ক্লাসের কী অবস্থা? আজকের কোনো আপডেট বা শিডিউল জানতে চান?"
 
     if re.search(r"\b(salam|assalam|assalamu|assalamualaikum|slaam)\b|সালাম|আসসালামু\s*আলাইকুম", clean):
         return "ওয়ালাইকুমুস সালাম ওয়া রাহমাতুল্লাহ! কেমন আছেন? আমি আপনার পার্সোনাল অ্যাসিস্ট্যান্ট। আজ আপনাকে কীভাবে সাহায্য করতে পারি?"
@@ -1097,71 +1112,88 @@ def conversational_reply(
         return "মাশাআল্লাহ! শুনে খুব ভালো লাগলো। আজকের কোনো কাজ বা পড়ালেখা সম্পর্কে কিছু জানতে চান?"
 
     if re.search(r"\b(tumi|apni)\s*(ke|k)\b|who\s*are\s*you|who\s*r\s*u|তুমি\s*কে|আপনি\s*কে", clean):
-        return "আমি আপনার পার্সোনাল একাডেমিক অ্যাসিস্ট্যান্ট! 🤖 আপনার Google Sheet এবং Doc দেখে প্রতিদিনের কাজ, অ্যাসাইনমেন্ট ও ডেডলাইন মনে করিয়ে দেওয়াই আমার কাজ।"
+        return "আমি আপনার পার্সোনাল একাডেমিক অ্যাসিস্ট্যান্ট! 🤖 আপনার Google Sheet এবং Doc দেখে প্রতিদিনের কাজ, ক্লাস রুটিন ও ডেডলাইন মনে করিয়ে দেওয়াই আমার কাজ।"
 
-    # 2. Bengali / Banglish task inquiries
-    has_today = bool(re.search(r"\b(aj|ajke|ajker)\b|আজ|আজকে|আজকের", clean))
-    has_tomorrow = bool(re.search(r"\b(kal|kalke|kalker)\b|কাল|কালকে|কালকের|আগামীকাল", clean))
+    # 6. Routine & Class Queries
+    has_class_word = bool(re.search(r"\b(class|routine|rutin|schedule|shodul|porashona|subject|sob|shob)\b|ক্লাস|রুটিন|পড়ালেখা|বিষয়", clean))
+
+    weekday_map = {
+        "shonibar": ("Saturday", "শনিবার"), "shoni": ("Saturday", "শনিবার"), "saturday": ("Saturday", "শনিবার"), "শনিবার": ("Saturday", "শনিবার"),
+        "robibar": ("Sunday", "রবিবার"), "robi": ("Sunday", "রবিবার"), "sunday": ("Sunday", "রবিবার"), "রবিবার": ("Sunday", "রবিবার"),
+        "sombar": ("Monday", "সোমবার"), "som": ("Monday", "সোমবার"), "monday": ("Monday", "সোমবার"), "সোমবার": ("Monday", "সোমবার"),
+        "mongolbar": ("Tuesday", "মঙ্গলবার"), "mongol": ("Tuesday", "মঙ্গলবার"), "tuesday": ("Tuesday", "মঙ্গলবার"), "মঙ্গলবার": ("Tuesday", "মঙ্গলবার"),
+        "budhbar": ("Wednesday", "বুধবার"), "budh": ("Wednesday", "বুধবার"), "wednesday": ("Wednesday", "বুধবার"), "বুধবার": ("Wednesday", "বুধবার"),
+        "brihospotibar": ("Thursday", "বৃহস্পতিবার"), "brihospoti": ("Thursday", "বৃহস্পতিবার"), "thursday": ("Thursday", "বৃহস্পতিবার"), "বৃহস্পতিবার": ("Thursday", "বৃহস্পতিবার"),
+        "shukrobar": ("Friday", "শুক্রবার"), "shukro": ("Friday", "শুক্রবার"), "friday": ("Friday", "শুক্রবার"), "শুক্রবার": ("Friday", "শুক্রবার"),
+    }
+
+    target_day_en = None
+    target_day_bn = None
+
+    if re.search(r"\b(aj|ajke|ajker|today)\b|আজ|আজকে|আজকের", clean):
+        target_day_en = today.strftime("%A")
+        target_day_bn = "আজকের (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+    elif re.search(r"\b(kal|kalke|kalker|tomorrow)\b|কাল|কালকে|কালকের|আগামীকাল", clean):
+        tom = today + timedelta(days=1)
+        target_day_en = tom.strftime("%A")
+        target_day_bn = "আগামীকালকের (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+    elif re.search(r"\b(porsho|porshu)\b|পরশু", clean):
+        porsh = today + timedelta(days=2)
+        target_day_en = porsh.strftime("%A")
+        target_day_bn = "পরশুর (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+    else:
+        for w_key, (d_en, d_bn) in weekday_map.items():
+            if re.search(rf"\b{w_key}\b|{w_key}", clean):
+                target_day_en = d_en
+                target_day_bn = f"{d_bn}ের"
+                break
+
+    # If asking for class/routine on a day
+    if target_day_en and (has_class_word or "ki" in clean or "কী" in clean):
+        day_classes = [
+            it for it in items
+            if it.due_date and it.due_date.strftime("%A").lower() == target_day_en.lower()
+            and ("room" in it.title.lower() or any(t in it.title for t in ["10:00", "11:30", "13:00"]))
+        ]
+        if day_classes:
+            lines = [f"📅 **{target_day_bn} ক্লাসের শিডিউল:**"]
+            for it in day_classes:
+                lines.append(f"• {it.title}")
+            return "\n".join(lines)
+        else:
+            return f"{target_day_bn} আপনার কোনো ক্লাস নির্ধারিত নেই! রিলাক্স থাকতে পারেন। 😊"
+
+    # Specific time class inquiry: "10tay ki class" / "11:30 te ki"
+    time_match = re.search(r"\b(10[:.]00|10|11[:.]30|11|1[:.]00|1|13[:.]00|13)\s*(?:tay|am|pm|টার|টায়)?\b", clean)
+    if time_match and (has_class_word or "ki" in clean or "room" in clean):
+        prefix = time_match.group(1)
+        target_time = "10:00" if "10" in prefix else ("11:30" if "11" in prefix else "13:00")
+        today_en = today.strftime("%A")
+        time_matches = [
+            it for it in items
+            if it.due_date and it.due_date.strftime("%A").lower() == today_en.lower()
+            and target_time in it.title
+        ]
+        if time_matches:
+            return f"আজকের শিডিউল অনুযায়ী সকাল {target_time} টায় আপনার ক্লাস:\n• {time_matches[0].title} 😊"
+        else:
+            return f"আজকে {target_time} টায় কোনো ক্লাস নির্ধারিত নেই।"
+
+    # 7. Bengali / Banglish task inquiries
     has_task_word = bool(re.search(r"\b(kaj|kaje|task|korte\s*hobe|ki\s*korbo|bad|baki|shesh|deadline)\b|কাজ|করতে\s*হবে|কী\s*করব|বাকি|বাদ|ডেডলাইন", clean))
     has_missed = bool(re.search(r"\b(bad|baki|overdue|miss|missed)\b|বাকি|বাদ|ছুটে|ওভারডিউ", clean))
 
-    # Questions like: "ajke ki kono kaj bad ache ba ki korte hobe" / "ajke ki kaj ache"
-    if has_today and (has_task_word or has_missed):
-        overdue = [it for it in items if it.due_date and it.due_date < today]
-        today_items = [it for it in items if it.due_date == today]
-        undated = [it for it in items if not it.due_date]
-
-        if overdue or today_items:
-            lines = ["📋 আজকের কাজের আপডেট:"]
-            if overdue:
-                lines.append("\n⚠️ আগের জমে থাকা/ওভারডিউ কাজ:")
-                for it in overdue:
-                    lines.append(f"• [{it.category}] {it.title} ({due_phrase(it.due_date, today)})")
-            if today_items:
-                lines.append("\n🔥 আজকের নির্ধারিত কাজ:")
-                for it in today_items:
-                    det = f" — {it.details}" if it.details else ""
-                    lines.append(f"• [{it.category}] {it.title}{det}")
-            lines.append("\nসময়মতো শেষ করে ফেলুন, শুভকামনা! 💪")
-            return "\n".join(lines)
-        else:
-            if undated:
-                undated_summary = "\n".join(f"• {it.title}" for it in undated[:4])
-                return (
-                    f"আলহামদুলিল্লাহ! আজকে আপনার কোনো নির্দিষ্ট ডেডলাইন বাকি নেই। 🎉\n\n"
-                    f"📌 তবে আপনার ডকুমেন্টে এই সাধারণ নোট/কাজগুলো আছে:\n{undated_summary}\n\n"
-                    f"আগামীকালের কাজ দেখতে 'কালকের কাজ' বা 'reminders' লিখে দেখতে পারেন।"
-                )
-            return (
-                "আলহামদুলিল্লাহ! আজকে আপনার কোনো কাজ বা ডেডলাইন বাকি নেই, সব ক্লিয়ার! 🎉\n"
-                "সামনের ডেডলাইনগুলো দেখতে চাইলে 'reminders' লিখে দেখতে পারেন।"
-            )
-
-    # Questions about tomorrow in Bengali / Banglish:
-    if has_tomorrow and has_task_word:
-        tomorrow = today + timedelta(days=1)
-        tomorrow_items = [it for it in items if it.due_date == tomorrow]
-        if tomorrow_items:
-            lines = [f"⏰ আগামীকালের নির্ধারিত কাজ ({_format_date(tomorrow, '%A')}):"]
-            for it in tomorrow_items:
+    if (has_task_word or has_missed) and target_day_en:
+        target_date = today if "আজ" in (target_day_bn or "") else (today + timedelta(days=1))
+        matching_tasks = [it for it in items if it.due_date == target_date]
+        if matching_tasks:
+            lines = [f"📋 {target_day_bn} কাজের আপডেট:"]
+            for it in matching_tasks:
                 det = f" — {it.details}" if it.details else ""
                 lines.append(f"• [{it.category}] {it.title}{det}")
-            lines.append("\nআগে থেকেই একটু গুছিয়ে রাখুন যাতে কালকে প্রেশার না হয়! 😊")
             return "\n".join(lines)
         else:
-            return "আগামীকালের জন্য কোনো নির্ধারিত কাজ বা ডেডলাইন নেই! নিশ্চিন্তে থাকতে পারেন। 😊"
-
-    # Questions specifically asking about missed / overdue / remaining tasks
-    if has_missed and (has_task_word or "kaj" in clean or "কাজ" in clean):
-        overdue = [it for it in items if it.due_date and it.due_date < today]
-        if overdue:
-            lines = ["🚨 আপনার নিচের কাজগুলোর ডেডলাইন পার হয়ে গেছে (Overdue):"]
-            for it in overdue:
-                lines.append(f"• [{it.category}] {it.title} — {due_phrase(it.due_date, today)}")
-            lines.append("\nযত দ্রুত সম্ভব এগুলো শেষ করে ফেলুন!")
-            return "\n".join(lines)
-        else:
-            return "আলহামদুলিল্লাহ, আপনার পেছনের কোনো কাজ ওভারডিউ বা বাকি নেই! সব আপ-টু-ডেট আছে। 👏"
+            return f"আলহামদুলিল্লাহ, {target_day_bn} কোনো অ্যাসাইনমেন্ট বা ডেডলাইনের চাপ নেই! 🎉"
 
     return None
 
@@ -1198,12 +1230,12 @@ def answer_question(
     if command in REMINDER_WORDS:
         return format_deadline_reminder(items, today, lead_days)
 
-    # 2. Smart Bengali / Banglish natural conversation helper
-    conv_reply = conversational_reply(question, items, today, lead_days)
+    # 4. Smart Bengali / Banglish natural conversation helper
+    conv_reply = conversational_reply(question, items, today, lead_days, user_id=user_id)
     if conv_reply:
         return conv_reply
 
-    # 3. Date-based query matching
+    # 5. Date-based query matching
     requested_date = _requested_date(question, today)
     if requested_date:
         matches = [item for item in items if item.due_date == requested_date]
@@ -1218,13 +1250,10 @@ def answer_question(
                 matches = assignments
         if not matches:
             return (
-                f"I couldn't find any tasks dated "
-                f"{_format_date(requested_date, '%B')}, {requested_date:%Y}."
+                f"{_format_date(requested_date, '%A, %B')} তারিখে আপনার কোনো নির্ধারিত টাস্ক বা ক্লাস পাওয়া যায়নি।"
             )
         return (
-            f"Here’s what I found for {_format_date(requested_date, '%A, %B')}, "
-            f"{requested_date:%Y}:\n"
-            + "\n".join(
+            f"📅 {_format_date(requested_date, '%A, %B')} তারিখের তথ্য:\n" + "\n".join(
                 f"• [{item.category}] {item.title}"
                 + (f" — {item.details}" if item.details else "")
                 + f" ({item.source})"
@@ -1235,7 +1264,7 @@ def answer_question(
     terms = {
         term
         for term in re.findall(r"[a-z0-9]+", question.lower())
-        if term not in {"what", "is", "my", "the", "for", "about", "tell", "me", "please"}
+        if term not in {"what", "is", "my", "the", "for", "about", "tell", "me", "please", "kire", "ki", "kmn", "kemon"}
     }
     ranked = []
     for item in items:
@@ -1245,13 +1274,12 @@ def answer_question(
             ranked.append((score, item))
     ranked.sort(key=lambda entry: entry[0], reverse=True)
     if not ranked:
-        return "I couldn't find matching information in your Google Sheet or Doc."
-    return "Here’s the relevant academic information I found:\n" + "\n".join(
+        return "আমি আপনার রুটিন ও ডক চেক করেছি, কিন্তু এই বিষয়ে নির্দিষ্ট কোনো তথ্য খুঁজে পাইনি। আপনি কি আজকের রুটিন, কালকের ক্লাস বা কোনো অ্যাসাইনমেন্ট সম্পর্কে জানতে চান? আমাকে লিখে জানাতে পারেন! 😊"
+    return "📌 আপনার অ্যাকাডেমিক তথ্য:\n" + "\n".join(
         f"• {item.title}"
         + (f" — {item.details}" if item.details else "")
-        + (f" (due {_format_date(item.due_date, '%b')})" if item.due_date else "")
-        + f" ({item.source})"
-        for _, item in ranked[:5]
+        + (f" ({_format_date(item.due_date, '%b')})" if item.due_date else "")
+        for _, item in ranked[:3]
     )
 
 
