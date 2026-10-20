@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import json
 import logging
 import os
@@ -510,6 +511,108 @@ def format_deadline_reminder(
     return "\n".join(lines)
 
 
+
+GEMINI_CANDIDATE_MODELS = tuple(
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3-flash-preview,gemini-3.5-flash,gemini-3.6-flash,gemini-3.1-flash-lite-preview",
+    ).split(",")
+    if m.strip()
+)
+
+
+def _request_gemini_candidate(
+    model: str,
+    url: str,
+    payload: dict,
+    timeout: int = 10,
+) -> Optional[tuple[str, str]]:
+    """Send a single Gemini API request. Returns (model_name, response_text) on success."""
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        if resp.status_code == 200:
+            text = (
+                resp.json()
+                .get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
+            if text:
+                return (model, text)
+            logger.warning("Gemini candidate %s returned empty text.", model)
+        elif resp.status_code == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
+            # Strip thinkingConfig in case this specific model does not support it
+            retry_payload = json.loads(json.dumps(payload))
+            retry_payload.get("generationConfig", {}).pop("thinkingConfig", None)
+            retry_resp = requests.post(url, json=retry_payload, timeout=timeout)
+            if retry_resp.status_code == 200:
+                text = (
+                    retry_resp.json()
+                    .get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    .strip()
+                )
+                if text:
+                    return (model, text)
+        else:
+            logger.warning("Gemini model %s returned HTTP %d: %s", model, resp.status_code, resp.text[:120])
+    except Exception as err:
+        logger.warning("Gemini model %s request failed: %s", model, err)
+    return None
+
+
+def _race_gemini_models(
+    models: Iterable[str],
+    api_key: str,
+    payload_builder: Callable[[str], dict],
+    timeout: int = 10,
+) -> Optional[tuple[str, str]]:
+    """
+    Race multiple Gemini models concurrently in parallel threads.
+    The first model to respond with HTTP 200 and a valid non-empty answer wins.
+    """
+    model_list = [m.strip() for m in models if m.strip()]
+    if not model_list or not api_key:
+        return None
+
+    t0 = time.time()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(model_list))
+    futures: dict[concurrent.futures.Future, str] = {}
+
+    for model in model_list:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = payload_builder(model)
+        fut = executor.submit(_request_gemini_candidate, model, url, payload, timeout)
+        futures[fut] = model
+
+    winner: Optional[tuple[str, str]] = None
+    try:
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            if res:
+                winner = res
+                elapsed = time.time() - t0
+                logger.info(
+                    "🏁 Gemini race winner: %s in %.2fs (length: %d chars)",
+                    winner[0],
+                    elapsed,
+                    len(winner[1]),
+                )
+                break
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            executor.shutdown(wait=False)
+
+    return winner
+
+
 def generate_ai_notification(
     notification_type: str,
     items: list[AcademicItem],
@@ -549,15 +652,8 @@ def generate_ai_notification(
         "3. Messenger formatting: Use bold '**Title**' and bullets '•'. Do NOT use '#' headers or '---' dividers."
     )
 
-    models = (
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.5-flash",
-        "gemini-flash-latest",
-    )
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = {
+    def _build_notification_payload(model_name: str) -> dict:
+        return {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.4,
@@ -565,22 +661,12 @@ def generate_ai_notification(
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=12)
-            if resp.status_code == 200:
-                text = (
-                    resp.json()
-                    .get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                    .strip()
-                )
-                if text:
-                    return text
-        except Exception as e:
-            logger.warning("AI notification generation failed with %s: %s", model, e)
-            continue
+
+    winner = _race_gemini_models(
+        GEMINI_CANDIDATE_MODELS, api_key, _build_notification_payload, timeout=12
+    )
+    if winner:
+        return winner[1]
 
     return fallback
 
@@ -851,12 +937,7 @@ def generate_gemini_reply(
         "   - Photos, images & documents: Examine all visual elements, formulas, routines, or PDFs and answer accurately and directly."
     )
 
-    models = (
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.5-flash",
-        "gemini-flash-latest",
-    )
+
 
     history = load_user_history(user_id)
     contents = []
@@ -902,9 +983,8 @@ def generate_gemini_reply(
     user_parts.append({"text": prompt_text})
     contents.append({"role": "user", "parts": user_parts})
 
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = {
+    def _build_chat_payload(model_name: str) -> dict:
+        return {
             "system_instruction": {
                 "parts": [{"text": system_instruction}]
             },
@@ -915,28 +995,17 @@ def generate_gemini_reply(
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                text = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                    .strip()
-                )
-                if text:
-                    if user_id:
-                        history_question = question if question else ("[Voice message]" if has_audio else "[Photo/File]")
-                        append_user_history(user_id, history_question, text)
-                    return text
-            else:
-                logger.warning("Gemini API %s error %d: %s", model, resp.status_code, resp.text[:150])
-                continue
-        except Exception as err:
-            logger.warning("Gemini API call failed for %s: %s", model, err)
-            continue
+
+    winner = _race_gemini_models(
+        GEMINI_CANDIDATE_MODELS, api_key, _build_chat_payload, timeout=12
+    )
+    if winner:
+        winning_model, winning_text = winner
+        if user_id:
+            history_question = question if question else ("[Voice message]" if has_audio else "[Photo/File]")
+            append_user_history(user_id, history_question, winning_text)
+        return winning_text
+
     return None
 
 
