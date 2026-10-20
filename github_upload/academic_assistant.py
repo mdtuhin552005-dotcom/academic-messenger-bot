@@ -697,6 +697,7 @@ DEFAULT_PROFILES = {
             "নাম তুহিন",
             "ডিপার্টমেন্ট CSE",
             "CSE বনাম Textile ক্রিকেট ম্যাচ খেলে",
+            "রোল নম্বর 514250",
         ],
     }
 }
@@ -869,6 +870,61 @@ def _fetch_attachment_part(att: dict) -> Optional[dict]:
     return None
 
 
+def _clean_repetitive_name(text: str, user_name: str, question: str = "") -> str:
+    """Ensure bot speaks like a discreet, natural personal agent without repetitive name addressing."""
+    if not text:
+        return text
+    is_name_query = bool(re.search(
+        r"\b(?:amar|my)\s*nam\b|আমার\s*নাম|who\s*am\s*i|আমাকে\s*চেনো|amake\s*cheno",
+        question,
+        re.IGNORECASE,
+    )) if question else False
+    if is_name_query:
+        return text
+
+    clean_name = re.split(r"[\s(]", user_name)[0].strip() if user_name else "তুহিন"
+    name_tokens = [re.escape(clean_name), "তুহিন", "tuhin"]
+    name_regex_part = "|".join(set(t for t in name_tokens if t))
+
+    cleaned = text
+    # Strip leading "তুহিন, " or "তুহিন ভাই, " or "Tuhin, "
+    cleaned = re.sub(
+        rf"^(?:{name_regex_part})(?:\s*(?:ভাই|bhai|bhaiya|vai))?\s*[,:!–-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Strip "বলো তুহিন, " / "বলুন তুহিন, "
+    cleaned = re.sub(
+        rf"\b(?:বলো|বলুন|bolo)\s*(?:{name_regex_part})[,\s]*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Strip name followed by comma mid-sentence
+    cleaned = re.sub(
+        rf"\s*\b(?:{name_regex_part})(?:\s*(?:ভাই|bhai|bhaiya|vai))?[,]\s*",
+        ", ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Strip ", তুহিন" in the middle or end
+    cleaned = re.sub(
+        rf",\s*(?:{name_regex_part})(?:\s*(?:ভাই|bhai|bhaiya|vai))?\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Strip trailing " তুহিন!" or " তুহিন."
+    cleaned = re.sub(
+        rf"\s+(?:{name_regex_part})(?:\s*(?:ভাই|bhai|bhaiya|vai))?([!?.]*)$",
+        r"\1",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
 def generate_gemini_reply(
     question: str,
     items: list[AcademicItem],
@@ -910,29 +966,32 @@ def generate_gemini_reply(
         f"Current tasks, assignments, deadlines, and notes from Google Sheets & Docs:\n"
         f"{items_text}\n\n"
         "STRICT CORE RULES:\n"
-        "1. MEMORY & CONTEXT (MANDATORY):\n"
-        f"   - You personally know this user! Their name is {user_name}.\n"
-        "   - Always remember who they are across all conversation turns.\n"
-        f"   - If they ask 'amar nam ki', 'who am i', or 'amake cheno', warmly confirm their name ({user_name})!\n"
-        f"   - Address them naturally and warmly as {user_name} when appropriate.\n"
-        "2. LANGUAGE ADAPTATION (MANDATORY):\n"
+        "1. PERSONAL AGENT PERSONA & ADDRESSING STYLE (CRITICAL - DO NOT SPAM USER'S NAME):\n"
+        "   - You are their elite, dedicated personal AI assistant/agent (যেমন একজন সত্যিকারের বিশ্বস্ত ব্যক্তিগত সহকারী)।\n"
+        "   - STRICT PROHIBITION ON REPEATING USER'S NAME: DO NOT repeatedly address the user by their name ('তুহিন')! NEVER start messages with 'তুহিন,' or sprinkle 'তুহিন' into regular conversation. It sounds robotic and irritating.\n"
+        "   - Speak directly, smoothly, politely, and respectfully like an executive personal assistant (use respectful 'আপনি' / 'আপনার' or natural conversational flow: 'জি, সকাল ১০টায় Physics II ক্লাস আছে...', 'আপনার অ্যাসাইনমেন্ট জমা দেওয়ার শেষ তারিখ...', 'আজকের শিডিউলে...').\n"
+        "   - ONLY mention their name if they specifically ask about identity, such as 'amar nam ki', 'who am i', or 'amake cheno'. In all other regular answers, NEVER utter their name.\n"
+        "2. SILENT MEMORY & CONTINUITY (MANDATORY):\n"
+        f"   - You silently know this user in depth (Name: {user_name}, Dept: {user_dept}, roll, preferences, and remembered notes).\n"
+        "   - Maintain complete continuity across conversation turns without explicitly announcing it unless asked.\n"
+        "3. LANGUAGE ADAPTATION (MANDATORY):\n"
         "   - If the user writes or speaks in English, reply ONLY in natural, fluent English.\n"
         "   - If the user writes or speaks in Banglish (e.g. 'kmn acho', 'ajke ki kaj ache') or Bengali, reply in authentic Bengali script (বাংলা ভাষায়).\n"
         "   - If the user writes in Bengali script (বাংলা), reply in Bengali script (বাংলা).\n"
-        "3. PROMPTS & CUSTOM INSTRUCTIONS (MANDATORY):\n"
+        "4. PROMPTS & CUSTOM INSTRUCTIONS (MANDATORY):\n"
         "   - If the user gives a specific format or instruction (e.g. 'bullet point e bolo', 'point akare dao', 'translate to...', 'solve this problem', '1 sentence e dao'), ALWAYS strictly follow that prompt instruction above all else.\n"
-        "4. EXACT TARGETED ANSWERING (MANDATORY - DO NOT OVER-ANSWER):\n"
+        "5. EXACT TARGETED ANSWERING (MANDATORY - DO NOT OVER-ANSWER):\n"
         "   - Answer ONLY the exact specific thing the user asked about. DO NOT dump the entire document, other subjects, or the full day's routine.\n"
         "   - Specific time query (যেমন: '১০টায় কি ক্লাস' বা '10 AM class'): Answer ONLY what is scheduled at 10:00 (যেমন: 'সকাল ১০:০০ টায় PHY127 - Physics II ক্লাস আছে (রুম: B3202)।'). NEVER mention other times, other classes, or unrelated assignments.\n"
         "   - Specific subject or task query (যেমন: 'physics assignment kobe'): Answer ONLY about that specific task/subject.\n"
         "   - Full schedule / routine: ONLY provide multiple classes or the full day's routine if the user explicitly asks for 'সারাদিনের রুটিন', 'সব ক্লাস', 'আজকের সব কাজ', or a specific day's routine (যেমন: 'রবিবারের রুটিন').\n"
-        "   - Casual chat & greetings: Keep within 1-2 friendly lines.\n"
+        "   - Casual chat & greetings: Keep within 1-2 polite, helpful lines like a real personal agent.\n"
         "   - Explanations, math, document/image questions, or voice queries:\n"
         "       * Give the direct, clear answer or solution first.\n"
         "       * Use at most 2-4 short bullet points if explaining steps.\n"
         "       * Strictly avoid unsolicited study advice, long lecturing, or filler conclusions.\n"
         "   - Messenger formatting: Never use '#' Markdown headers. Use bold '**Title**' and bullet points '•'.\n"
-        "5. MULTIMODAL INPUTS (MANDATORY):\n"
+        "6. MULTIMODAL INPUTS (MANDATORY):\n"
         "   - Voice notes / audio: Listen carefully to what was spoken in any language and reply concisely.\n"
         "   - Photos, images & documents: Examine all visual elements, formulas, routines, or PDFs and answer accurately and directly."
     )
@@ -1001,6 +1060,7 @@ def generate_gemini_reply(
     )
     if winner:
         winning_model, winning_text = winner
+        winning_text = _clean_repetitive_name(winning_text, user_name, question)
         if user_id:
             history_question = question if question else ("[Voice message]" if has_audio else "[Photo/File]")
             append_user_history(user_id, history_question, winning_text)
