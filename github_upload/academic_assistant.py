@@ -91,9 +91,10 @@ def parse_date(value: str, current_date: Optional[date] = None) -> Optional[date
     for target_val in (cleaned, value):
         for date_format in formats:
             try:
-                parsed = datetime.strptime(target_val, date_format).date()
                 if "%Y" not in date_format and "%y" not in date_format:
-                    parsed = parsed.replace(year=current_date.year)
+                    parsed = datetime.strptime(f"{target_val} {current_date.year}", f"{date_format} %Y").date()
+                else:
+                    parsed = datetime.strptime(target_val, date_format).date()
                 return parsed
             except ValueError:
                 continue
@@ -549,18 +550,23 @@ def generate_ai_notification(
     )
 
     models = (
-        "gemini-flash-lite-latest",
+        "gemini-3-flash-preview",
         "gemini-3.1-flash-lite-preview",
+        "gemini-3.5-flash",
         "gemini-flash-latest",
     )
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 300},
+            "generationConfig": {
+                "temperature": 0.4,
+                "maxOutputTokens": 300,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }
         try:
-            resp = requests.post(url, json=payload, timeout=20)
+            resp = requests.post(url, json=payload, timeout=12)
             if resp.status_code == 200:
                 text = (
                     resp.json()
@@ -592,8 +598,91 @@ def _requested_date(question: str, today: date) -> Optional[date]:
 
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "chat_history.json")
+USER_MEMORY_FILE = os.path.join(os.path.dirname(__file__), "user_memory.json")
 _memory_lock = Lock()
-_MAX_HISTORY_TURNS = 16  # keeps last 8 exchanges (8 user + 8 model)
+_user_memory_lock = Lock()
+_MAX_HISTORY_TURNS = 20  # keeps last 10 exchanges (10 user + 10 model)
+
+DEFAULT_PROFILES = {
+    "28808065895499807": {
+        "name": "তুহিন (Tuhin)",
+        "department": "CSE",
+        "notes": [
+            "নাম তুহিন",
+            "ডিপার্টমেন্ট CSE",
+            "CSE বনাম Textile ক্রিকেট ম্যাচ খেলে",
+        ],
+    }
+}
+
+
+def load_user_profile(user_id: Optional[str]) -> dict:
+    if not user_id:
+        return {}
+    uid = str(user_id)
+    with _user_memory_lock:
+        data = {}
+        if os.path.isfile(USER_MEMORY_FILE):
+            try:
+                with open(USER_MEMORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load user profile: %s", e)
+        if uid not in data and uid in DEFAULT_PROFILES:
+            data[uid] = DEFAULT_PROFILES[uid]
+            save_user_profile(uid, data[uid])
+        return data.get(uid, DEFAULT_PROFILES.get(uid, {}))
+
+
+def save_user_profile(user_id: Optional[str], profile: dict) -> None:
+    if not user_id:
+        return
+    uid = str(user_id)
+    with _user_memory_lock:
+        data = {}
+        if os.path.isfile(USER_MEMORY_FILE):
+            try:
+                with open(USER_MEMORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[uid] = profile
+        try:
+            with open(USER_MEMORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save user profile: %s", e)
+
+
+def remember_user_fact(user_id: Optional[str], text: str) -> None:
+    """Extract and remember user facts (name, preferences, custom notes)."""
+    if not user_id or not text:
+        return
+    profile = load_user_profile(user_id)
+    cleaned = text.strip()
+    lowered = cleaned.lower()
+
+    # Name extraction: 'amar nam [X]', 'my name is [X]'
+    name_match = re.search(r"\b(?:amar|amr)\s*nam(?:\s*ki\b)?\s*[:=]?\s*([A-Za-z\u0980-\u09FF\s]+)", cleaned, re.IGNORECASE)
+    if not name_match:
+        name_match = re.search(r"\bmy\s*name\s*is\s*([A-Za-z\u0980-\u09FF\s]+)", cleaned, re.IGNORECASE)
+    if name_match and "ki" not in lowered.split()[:3]:
+        extracted = name_match.group(1).strip().strip("!?. ")
+        if extracted and len(extracted) < 40 and not any(w in extracted.lower() for w in ["ki", "bolo", "bholcho", "jano", "bhalo"]):
+            profile["name"] = extracted
+
+    # Memory note: 'mone rakhba ...', 'remember that ...'
+    rem_match = re.search(r"\b(?:mone|mon)\s*(?:rakhba|rekho|rakho)\s*(?:je|j)?\s*(.+)", cleaned, re.IGNORECASE)
+    if not rem_match:
+        rem_match = re.search(r"\bremember\s*(?:that)?\s*(.+)", cleaned, re.IGNORECASE)
+    if rem_match:
+        fact = rem_match.group(1).strip().strip("!?. ")
+        if fact:
+            notes = profile.setdefault("notes", [])
+            if fact not in notes:
+                notes.append(fact)
+
+    save_user_profile(user_id, profile)
 
 
 def load_user_history(user_id: Optional[str]) -> list[dict]:
@@ -716,14 +805,30 @@ def generate_gemini_reply(
         )
     items_text = "\n".join(items_summary) if items_summary else "No tasks currently recorded."
 
+    # Persistent user memory & profile
+    remember_user_fact(user_id, question)
+    profile = load_user_profile(user_id)
+    user_name = profile.get("name", "তুহিন (Tuhin)" if str(user_id) == os.getenv("ACADEMIC_RECIPIENT_PSID") else "তুহিন")
+    user_dept = profile.get("department", "CSE")
+    user_notes = profile.get("notes", [])
+
+    profile_text = f"- User's Name: {user_name}\n- Department: {user_dept}"
+    if user_notes:
+        profile_text += "\n- Remembered Facts & Memories:\n" + "\n".join(f"  • {n}" for n in user_notes)
+
     system_instruction = (
         "You are an empathetic, highly intelligent, warm personal academic and daily assistant talking to the user on Facebook Messenger.\n"
         f"Today's date is: {today.strftime('%A, %B %d, %Y')}.\n\n"
+        f"=== PERMANENT USER PROFILE & MEMORY ===\n"
+        f"{profile_text}\n\n"
         f"Current tasks, assignments, deadlines, and notes from Google Sheets & Docs:\n"
         f"{items_text}\n\n"
         "STRICT CORE RULES:\n"
-        "1. MEMORY & CONTEXT:\n"
-        "   - You remember past conversation turns from this chat. Seamlessly reference past context when appropriate.\n"
+        "1. MEMORY & CONTEXT (MANDATORY):\n"
+        f"   - You personally know this user! Their name is {user_name}.\n"
+        "   - Always remember who they are across all conversation turns.\n"
+        f"   - If they ask 'amar nam ki', 'who am i', or 'amake cheno', warmly confirm their name ({user_name})!\n"
+        f"   - Address them naturally and warmly as {user_name} when appropriate.\n"
         "2. LANGUAGE ADAPTATION (MANDATORY):\n"
         "   - If the user writes or speaks in English, reply ONLY in natural, fluent English.\n"
         "   - If the user writes or speaks in Banglish (e.g. 'kmn acho', 'ajke ki kaj ache') or Bengali, reply in authentic Bengali script (বাংলা ভাষায়).\n"
@@ -747,18 +852,24 @@ def generate_gemini_reply(
     )
 
     models = (
-        "gemini-flash-lite-latest",
+        "gemini-3-flash-preview",
         "gemini-3.1-flash-lite-preview",
+        "gemini-3.5-flash",
         "gemini-flash-latest",
     )
 
     history = load_user_history(user_id)
     contents = []
+    expected_role = "user"
     for turn in history:
         role = turn.get("role", "user")
-        text = turn.get("text", "")
-        if text:
+        text = turn.get("text", "").strip()
+        if text and role == expected_role:
             contents.append({"role": role, "parts": [{"text": text}]})
+            expected_role = "model" if expected_role == "user" else "user"
+
+    if contents and contents[-1]["role"] == "user":
+        contents.pop()
 
     user_parts = []
     has_audio = False
@@ -800,11 +911,12 @@ def generate_gemini_reply(
             "contents": contents,
             "generationConfig": {
                 "temperature": 0.2,
-                "maxOutputTokens": 300,
+                "maxOutputTokens": 350,
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         try:
-            resp = requests.post(url, json=payload, timeout=25)
+            resp = requests.post(url, json=payload, timeout=12)
             if resp.status_code == 200:
                 data = resp.json()
                 text = (
