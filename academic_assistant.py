@@ -913,6 +913,71 @@ def _clean_repetitive_name(text: str, user_name: str, question: str = "") -> str
     return cleaned.strip()
 
 
+def generate_groq_reply(
+    question: str,
+    items: list[AcademicItem],
+    today: date,
+    api_key: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Fallback LLM engine using Groq (Llama 3.3 70B) for ultra-fast, unlimited conversation."""
+    api_key = api_key or os.getenv("GROQ_API_KEY")
+    if not api_key or not question:
+        return None
+
+    profile = load_user_profile(user_id)
+    user_name = profile.get("name", "তুহিন")
+    user_dept = profile.get("department", "CSE")
+    user_notes = profile.get("notes", [])
+
+    profile_text = f"- User's Name: {user_name}\n- Department: {user_dept}"
+    if user_notes:
+        profile_text += "\n- Remembered notes: " + ", ".join(user_notes)
+
+    items_text = "\n".join(
+        f"- [{it.category}] {it.title} (Due: {it.due_date})"
+        for it in items
+    ) or "No items recorded."
+
+    system_prompt = (
+        "You are an elite, highly intelligent, warm personal academic and daily AI assistant on Facebook Messenger.\n"
+        f"Today is {today.strftime('%A, %B %d, %Y')}.\n\n"
+        f"=== USER PROFILE ===\n{profile_text}\n\n"
+        f"=== ACADEMIC DATA & ROUTINE ===\n{items_text}\n\n"
+        "STRICT RULES:\n"
+        "1. You are their personal AI agent. Answer ANY query (academic, routines, general knowledge, life, code, math, friendly chat).\n"
+        "2. Do NOT repeatedly mention the user's name ('তুহিন') in regular conversation. Speak directly, politely, and respectfully.\n"
+        "3. Reply in authentic Bengali script (বাংলা) if user writes in Bengali or Banglish. If English, reply in English.\n"
+        "4. Be concise, direct, helpful, and polite."
+    )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 350,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=8)
+        if resp.status_code == 200:
+            txt = resp.json()["choices"][0]["message"]["content"].strip()
+            if txt:
+                return _clean_repetitive_name(txt, user_name, question)
+        else:
+            logger.warning("Groq API returned HTTP %d: %s", resp.status_code, resp.text[:120])
+    except Exception as err:
+        logger.warning("Groq API request failed: %s", err)
+    return None
+
+
 def generate_gemini_reply(
     question: str,
     items: list[AcademicItem],
@@ -1066,7 +1131,7 @@ def conversational_reply(
 ) -> Optional[str]:
     """Smart built-in Bengali / Banglish conversational and schedule assistant."""
     lowered = question.lower().strip()
-    clean = re.sub(r"[^\w\sঀ-৿]", " ", lowered)
+    clean = re.sub(r"[^\w\s\u0980-\u09FF]", " ", lowered)
     clean = re.sub(r"\s+", " ", clean).strip()
 
     # Load permanent user memory
@@ -1080,6 +1145,11 @@ def conversational_reply(
     user_name = profile.get("name", "তুহিন")
     clean_user_name = re.split(r"[\s(]", user_name)[0].strip() or "তুহিন"
     dept_name = profile.get("department", "CSE")
+
+    bn_days = {
+        "Saturday": "শনিবার", "Sunday": "রবিবার", "Monday": "সোমবার",
+        "Tuesday": "মঙ্গলবার", "Wednesday": "বুধবার", "Thursday": "বৃহস্পতিবার", "Friday": "শুক্রবার"
+    }
 
     # 1. Roll number queries
     if re.search(r"\b(roll|rol)\b|রোল", clean):
@@ -1098,7 +1168,20 @@ def conversational_reply(
         remember_user_fact(user_id, question)
         return "অবশ্যই, আমি আপনার এই তথ্যটি মনে রেখেছি এবং সেভ করে নিয়েছি! 📝"
 
-    # 5. Greetings & Well-being
+    # 5. Day of the week queries
+    if re.search(r"\b(aj|ajke)\s*(ki\s*bar|kibar)\b|আজ\s*কী\s*বার|আজকে\s*কী\s*বার", clean):
+        return f"আজকে হলো **{bn_days.get(today.strftime('%A'), today.strftime('%A'))}**। 🗓️"
+    if re.search(r"\b(kal|kalke)\s*(ki\s*bar|kibar)\b|কাল\s*কী\s*বার|কালকে\s*কী\s*বার", clean):
+        tom = today + timedelta(days=1)
+        return f"আগামীকাল হলো **{bn_days.get(tom.strftime('%A'), tom.strftime('%A'))}**। 🗓️"
+
+    # 6. Feelings & Casual Chat
+    if re.search(r"\b(bhalo|valo)\s*lage\s*na\b|ভালো\s*লাগে\s*না|মন\s*খারাপ", clean):
+        return "মন খারাপ করবেন না! একটু রিল্যাক্স করুন বা একটু হেঁটে আসুন। পড়ালেখা বা যেকোনো প্রয়োজনে আমি সবসময় আপনার পাশে আছি! 😊✨"
+
+    if re.search(r"\b(ki\s*koro|ki\s*kortaso|ki\s*koren)\b|কী\s*কর", clean):
+        return "আপনার ক্লাসের রুটিন ও শিডিউল নিয়ে প্রস্তুত আছি! আজকের বা কালকের কোনো আপডেট জানতে চান? 📚"
+
     if re.search(r"\b(kire|ki\s*khobor|ki\s*obostha|kmn|kemon|kemn|hi|hello|hey)\b|কেমন|কী\s*অবস্থা|কী\s*খবর", clean):
         return "আলহামদুলিল্লাহ, আমি খুব ভালো আছি! 😊 আপনার পড়াশোনা বা ক্লাসের কী অবস্থা? আজকের কোনো আপডেট বা শিডিউল জানতে চান?"
 
@@ -1111,10 +1194,10 @@ def conversational_reply(
     if re.search(r"\b(alhamdulillah|alhamdullilah)\b|আলহামদুলিল্লাহ", clean):
         return "মাশাআল্লাহ! শুনে খুব ভালো লাগলো। আজকের কোনো কাজ বা পড়ালেখা সম্পর্কে কিছু জানতে চান?"
 
-    if re.search(r"\b(tumi|apni)\s*(ke|k)\b|who\s*are\s*you|who\s*r\s*u|তুমি\s*কে|আপনি\s*কে", clean):
-        return "আমি আপনার পার্সোনাল একাডেমিক অ্যাসিস্ট্যান্ট! 🤖 আপনার Google Sheet এবং Doc দেখে প্রতিদিনের কাজ, ক্লাস রুটিন ও ডেডলাইন মনে করিয়ে দেওয়াই আমার কাজ।"
+    if re.search(r"\b(tumi|apni)\s*(ke|k)\b|\b(ki\s*korte\s*paro|tumi\s*ki|tumar\s*kaj\s*ki)\b|who\s*are\s*you|who\s*r\s*u|তুমি\s*কে|আপনি\s*কে|কী\s*করতে\s*পার|তোমার\s*কাজ\s*কী", clean):
+        return "আমি আপনার সার্বক্ষণিক পার্সোনাল অ্যাকাডেমিক এজেন্ট! 🤖 আপনার ক্লাস রুটিন মনে রাখা, অ্যাসাইনমেন্ট ও ডেডলাইন ট্র্যাকিং এবং পড়ালেখার যেকোনো সহায়তায় সাহায্য করাই আমার কাজ।"
 
-    # 6. Routine & Class Queries
+    # 7. Routine & Class Queries
     has_class_word = bool(re.search(r"\b(class|routine|rutin|schedule|shodul|porashona|subject|sob|shob)\b|ক্লাস|রুটিন|পড়ালেখা|বিষয়", clean))
 
     weekday_map = {
@@ -1132,15 +1215,15 @@ def conversational_reply(
 
     if re.search(r"\b(aj|ajke|ajker|today)\b|আজ|আজকে|আজকের", clean):
         target_day_en = today.strftime("%A")
-        target_day_bn = "আজকের (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+        target_day_bn = "আজকের (" + bn_days.get(target_day_en, target_day_en) + ")"
     elif re.search(r"\b(kal|kalke|kalker|tomorrow)\b|কাল|কালকে|কালকের|আগামীকাল", clean):
         tom = today + timedelta(days=1)
         target_day_en = tom.strftime("%A")
-        target_day_bn = "আগামীকালকের (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+        target_day_bn = "আগামীকালকের (" + bn_days.get(target_day_en, target_day_en) + ")"
     elif re.search(r"\b(porsho|porshu)\b|পরশু", clean):
         porsh = today + timedelta(days=2)
         target_day_en = porsh.strftime("%A")
-        target_day_bn = "পরশুর (" + weekday_map.get(target_day_en.lower(), ("", target_day_en))[1] + ")"
+        target_day_bn = "পরশুর (" + bn_days.get(target_day_en, target_day_en) + ")"
     else:
         for w_key, (d_en, d_bn) in weekday_map.items():
             if re.search(rf"\b{w_key}\b|{w_key}", clean):
@@ -1179,7 +1262,7 @@ def conversational_reply(
         else:
             return f"আজকে {target_time} টায় কোনো ক্লাস নির্ধারিত নেই।"
 
-    # 7. Bengali / Banglish task inquiries
+    # 8. Bengali / Banglish task inquiries
     has_task_word = bool(re.search(r"\b(kaj|kaje|task|korte\s*hobe|ki\s*korbo|bad|baki|shesh|deadline)\b|কাজ|করতে\s*হবে|কী\s*করব|বাকি|বাদ|ডেডলাইন", clean))
     has_missed = bool(re.search(r"\b(bad|baki|overdue|miss|missed)\b|বাকি|বাদ|ছুটে|ওভারডিউ", clean))
 
@@ -1197,7 +1280,6 @@ def conversational_reply(
 
     return None
 
-
 def answer_question(
     question: str,
     items: list[AcademicItem],
@@ -1212,30 +1294,34 @@ def answer_question(
     if command in {"help", "commands", "menu"} and not attachments:
         return HELP_TEXT
 
-    # 1. AI reply with Gemini (supports text, voice audio, images, files)
+    # 1. AI reply with Gemini
     ai_reply = generate_gemini_reply(
         question, items, today, lead_days, user_id=user_id, attachments=attachments
     )
+    # 2. Fallback AI with Groq if Gemini hits 429 quota or fails
+    if not ai_reply and not attachments and question:
+        ai_reply = generate_groq_reply(question, items, today, user_id=user_id)
+
     if ai_reply:
         return ai_reply
 
     if not question and attachments:
         return "আমি আপনার পাঠানো ফাইল/ভয়েস মেসেজটি পেয়েছি, কিন্তু এই মুহূর্তে এআই প্রসেস করতে পারছে না। দয়া করে একটু পর আবার চেষ্টা করুন বা লিখে জানান! 😊"
 
-    # 2. Offline fallback for help greetings
+    # 3. Offline fallback for help greetings
     if command in GREETING_WORDS:
         return HELP_TEXT
 
-    # 3. Reminder keywords
+    # 4. Reminder keywords
     if command in REMINDER_WORDS:
         return format_deadline_reminder(items, today, lead_days)
 
-    # 4. Smart Bengali / Banglish natural conversation helper
+    # 5. Smart Bengali / Banglish conversational responder
     conv_reply = conversational_reply(question, items, today, lead_days, user_id=user_id)
     if conv_reply:
         return conv_reply
 
-    # 5. Date-based query matching
+    # 6. Date-based query matching
     requested_date = _requested_date(question, today)
     if requested_date:
         matches = [item for item in items if item.due_date == requested_date]
@@ -1253,7 +1339,8 @@ def answer_question(
                 f"{_format_date(requested_date, '%A, %B')} তারিখে আপনার কোনো নির্ধারিত টাস্ক বা ক্লাস পাওয়া যায়নি।"
             )
         return (
-            f"📅 {_format_date(requested_date, '%A, %B')} তারিখের তথ্য:\n" + "\n".join(
+            f"📅 {_format_date(requested_date, '%A, %B')} তারিখের তথ্য:\n"
+            + "\n".join(
                 f"• [{item.category}] {item.title}"
                 + (f" — {item.details}" if item.details else "")
                 + f" ({item.source})"
@@ -1261,10 +1348,11 @@ def answer_question(
             )
         )
 
+    # 7. Targeted academic keyword matching
     terms = {
         term
         for term in re.findall(r"[a-z0-9]+", question.lower())
-        if term not in {"what", "is", "my", "the", "for", "about", "tell", "me", "please", "kire", "ki", "kmn", "kemon"}
+        if term not in {"what", "is", "my", "the", "for", "about", "tell", "me", "please", "kire", "ki", "kmn", "kemon", "koto"}
     }
     ranked = []
     for item in items:
@@ -1273,15 +1361,21 @@ def answer_question(
         if score:
             ranked.append((score, item))
     ranked.sort(key=lambda entry: entry[0], reverse=True)
-    if not ranked:
-        return "আমি আপনার রুটিন ও ডক চেক করেছি, কিন্তু এই বিষয়ে নির্দিষ্ট কোনো তথ্য খুঁজে পাইনি। আপনি কি আজকের রুটিন, কালকের ক্লাস বা কোনো অ্যাসাইনমেন্ট সম্পর্কে জানতে চান? আমাকে লিখে জানাতে পারেন! 😊"
-    return "📌 আপনার অ্যাকাডেমিক তথ্য:\n" + "\n".join(
-        f"• {item.title}"
-        + (f" — {item.details}" if item.details else "")
-        + (f" ({_format_date(item.due_date, '%b')})" if item.due_date else "")
-        for _, item in ranked[:3]
-    )
+    if ranked:
+        return "📌 আপনার অ্যাকাডেমিক তথ্য:\n" + "\n".join(
+            f"• {item.title}"
+            + (f" — {item.details}" if item.details else "")
+            + (f" ({_format_date(item.due_date, '%b')})" if item.due_date else "")
+            for _, item in ranked[:3]
+        )
 
+    # 8. Friendly, transparent agent fallback
+    return (
+        "আমি আপনার সাথে একজন সার্বক্ষণিক পার্সোনাল সহকারী হিসেবে যুক্ত আছি! 🤖 "
+        "এই মুহূর্তে মুক্ত এআই চ্যাটের জন্য গুগলের ফ্রি এপিআই কোটা সাময়িকভাবে শেষ হয়েছে। "
+        "তবে আপনার সকল ক্লাস রুটিন, শিডিউল, রোল ও অ্যাকাডেমিক তথ্য সবসময় শতভাগ সচল আছে! "
+        "আজকের রুটিন, কালকের ক্লাস বা যেকোনো শিডিউল জানতে এখনই লিখে জানাতে পারেন! 😊"
+    )
 
 def repository_from_environment() -> GoogleAcademicRepository:
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
